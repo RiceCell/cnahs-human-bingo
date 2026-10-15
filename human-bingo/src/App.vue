@@ -4,6 +4,8 @@ import { FREE_SQUARE, SQUARES } from './bingoCard'
 
 type Player = { id: string; name: string; code: string; bingo_at: string | null }
 type Claim = { square_index: number; signed_by: string }
+type PendingClaim = { square_index: number; signed_by: string }
+type CardResponse = { player: Player; claims: Claim[]; pending?: PendingClaim[]; requests: ReviewRequest[] }
 type ReviewRequest = { id: string; square_index: number; claimant_name: string }
 type Board = {
   winners: { id: string; name: string; bingo_at: string }[]
@@ -23,6 +25,7 @@ const BOARD_POLL_BASE = 16000
 
 const player = ref<Player | null>(null)
 const claims = ref<Claim[]>([])
+const pendingClaims = ref<PendingClaim[]>([])
 const pendingRequests = ref<ReviewRequest[]>([])
 const board = ref<Board | null>(null)
 const tab = ref<'card' | 'board'>('card')
@@ -51,6 +54,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 // ---- Card state ----
 const claimedBy = computed(() => new Map(claims.value.map((c) => [c.square_index, c.signed_by])))
+const pendingBy = computed(() => new Map(pendingClaims.value.map((c) => [c.square_index, c.signed_by])))
 const isFilled = (i: number) => i === FREE_SQUARE || claimedBy.value.has(i)
 
 const winningSquares = computed(() => {
@@ -72,10 +76,14 @@ const goalText = computed(() =>
 
 const firstName = (name: string) => name.trim().split(/\s+/)[0] ?? name
 const signedName = (i: number) => firstName(claimedBy.value.get(i) ?? '')
+const tileSign = (i: number) => (claimedBy.value.has(i) ? signedName(i) : pendingBy.value.has(i) ? 'Pending' : '')
 
 function tileLabel(i: number) {
   const who = claimedBy.value.get(i)
-  return `${SQUARES[i].prompt}. ${who ? `Signed by ${who}.` : 'Not signed yet.'}`
+  const waiting = pendingBy.value.get(i)
+  if (who) return `${SQUARES[i].prompt}. Signed by ${who}.`
+  if (waiting) return `${SQUARES[i].prompt}. Waiting for ${waiting} to verify.`
+  return `${SQUARES[i].prompt}. Not signed yet.`
 }
 
 const timeFmt = new Intl.DateTimeFormat([], { hour: 'numeric', minute: '2-digit' })
@@ -91,13 +99,14 @@ async function join() {
   error.value = ''
   notice.value = ''
   try {
-    const r = await api<{ player: Player; claims: Claim[]; requests: ReviewRequest[] }>('/api/join', {
+    const r = await api<CardResponse>('/api/join', {
       method: 'POST',
       body: JSON.stringify({ name: nameInput.value }),
     })
     player.value = r.player
     claims.value = r.claims
     pendingRequests.value = r.requests
+    pendingClaims.value = r.pending ?? []
     localStorage.setItem(STORAGE_KEY, r.player.id)
     syncPolling()
   } catch (e) {
@@ -111,10 +120,11 @@ async function restore() {
   const id = localStorage.getItem(STORAGE_KEY)
   if (id) {
     try {
-      const r = await api<{ player: Player; claims: Claim[]; requests: ReviewRequest[] }>(`/api/card?id=${id}`)
+      const r = await api<CardResponse>(`/api/card?id=${id}`)
       player.value = r.player
       claims.value = r.claims
       pendingRequests.value = r.requests
+      pendingClaims.value = r.pending ?? []
     } catch (e) {
       // Only forget the card if the server says it doesn't exist
       if ((e as { status?: number }).status === 404) localStorage.removeItem(STORAGE_KEY)
@@ -128,14 +138,13 @@ async function restore() {
 async function loadCard() {
   if (!player.value) return
   try {
-    const r = await api<{ player: Player; claims: Claim[]; requests: ReviewRequest[] }>(
-      `/api/card?id=${player.value.id}`
-    )
+    const r = await api<CardResponse>(`/api/card?id=${player.value.id}`)
     const previousSquares = new Set(claims.value.map((claim) => claim.square_index))
     const hadBingo = hasBingo.value
     player.value = r.player
     claims.value = r.claims
     pendingRequests.value = r.requests
+    pendingClaims.value = r.pending ?? []
     cardFailed.value = false
     const newlySigned = r.claims.find((claim) => !previousSquares.has(claim.square_index))
     if (newlySigned) flashSigned(newlySigned.square_index)
@@ -170,6 +179,7 @@ async function mutate(method: 'POST' | 'DELETE') {
     return
   }
   const square = sheet.value
+  const wasPending = pendingBy.value.has(square)
   busy.value = true
   error.value = ''
   try {
@@ -184,10 +194,11 @@ async function mutate(method: 'POST' | 'DELETE') {
     claims.value = r.claims
     player.value.bingo_at = r.bingoAt
     closeSheet()
+    await loadCard()
     if (method === 'POST') {
       notice.value = `Signature request sent to ${r.requestSentTo ?? 'the code owner'}. It will count once they verify it.`
     } else {
-      notice.value = 'Signature removed.'
+      notice.value = wasPending ? 'Request cancelled.' : 'Signature removed.'
     }
   } catch (e) {
     error.value = (e as Error).message
@@ -461,12 +472,12 @@ onUnmounted(() => {
             v-else
             type="button"
             class="tile"
-            :class="[(i + Math.floor(i / 5)) % 2 ? 'gold' : 'red', { signed: claimedBy.has(i), win: winningSquares.has(i) }]"
+            :class="[(i + Math.floor(i / 5)) % 2 ? 'gold' : 'red', { signed: claimedBy.has(i), pending: !claimedBy.has(i) && pendingBy.has(i), win: winningSquares.has(i) }]"
             :aria-label="tileLabel(i)"
             @click="openSheet(i)"
           >
             <span class="tile-label">{{ sq.label }}</span>
-            <span class="tile-sign" :class="{ writing: justSigned === i }">{{ signedName(i) }}</span>
+            <span class="tile-sign" :class="{ writing: justSigned === i }">{{ tileSign(i) }}</span>
           </button>
         </template>
       </section>
@@ -567,6 +578,15 @@ onUnmounted(() => {
             <p class="signed-by">Signed by <span class="ink">{{ claimedBy.get(sheet) }}</span></p>
             <button type="button" class="btn ghost" :disabled="busy" @click="mutate('DELETE')">
               Remove signature
+            </button>
+          </template>
+
+          <template v-else-if="pendingBy.has(sheet)">
+            <p class="signed-by">
+              Waiting for <span class="ink">{{ pendingBy.get(sheet) }}</span> to verify your signature.
+            </p>
+            <button type="button" class="btn ghost" :disabled="busy" @click="mutate('DELETE')">
+              {{ busy ? 'Cancelling…' : 'Cancel request' }}
             </button>
           </template>
 
@@ -763,6 +783,8 @@ label { display: block; font-weight: 700; font-size: 15px; margin-bottom: 6px; }
 .tile.signed { background: var(--linen); color: rgba(61, 15, 8, 0.55); }
 .tile.signed .tile-sign { color: var(--pen); border-color: rgba(31, 63, 166, 0.45); }
 .tile.signed .tile-label { font-weight: 600; }
+.tile.pending { box-shadow: inset 0 0 0 2px rgba(255, 245, 228, 0.85); }
+.tile.pending .tile-sign { font-family: var(--font); font-size: 11px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; border-bottom-style: dashed; opacity: 0.9; }
 .tile.win {
   background: radial-gradient(circle at 50% 30%, #fff0b3, #f4b43a); color: var(--ember-deep);
   box-shadow: inset 0 0 0 2px var(--ember);

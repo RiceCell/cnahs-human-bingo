@@ -6,7 +6,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const { playerId, code, requestId, decision } = req.body ?? {}
     if (!UUID.test(String(playerId))) return res.status(400).json({ error: 'Bad player id' })
-    if (!UUID.test(String(requestId))) return res.status(400).json({ error: 'Bad request id' })
+
+    // claims.id is an integer, not a UUID
+    const claimId = Number(requestId)
+    if (!Number.isSafeInteger(claimId) || claimId <= 0) {
+        return res.status(400).json({ error: 'Bad request id' })
+    }
+
     if (decision !== 'approve' && decision !== 'reject') {
         return res.status(400).json({ error: 'Bad decision' })
     }
@@ -27,7 +33,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const { data: request, error: requestError } = await db
             .from('claims')
             .select('id, player_id')
-            .eq('id', requestId)
+            .eq('id', claimId)
             .eq('signer_id', owner.id)
             .eq('status', 'pending')
             .maybeSingle()

@@ -21,6 +21,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .eq('status', 'approved')
     if (claimsError) return res.status(500).json({ error: claimsError.message })
 
+    // The player's own signature requests that are still waiting for the signer
+    const { data: pending, error: pendingError } = await db
+        .from('claims')
+        .select('square_index, signed_by')
+        .eq('player_id', id)
+        .eq('status', 'pending')
+    if (pendingError) return res.status(500).json({ error: pendingError.message })
+
     const { data: requests, error: requestsError } = await db
         .from('claims')
         .select('id, player_id, square_index')
@@ -48,5 +56,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         })
     }
 
-    return res.status(200).json({ player, claims: claims ?? [], requests: pendingRequests })
+    return res.status(200).json({
+        player,
+        claims: claims ?? [],
+        pending: pending ?? [],
+        requests: pendingRequests,
+    })
 }

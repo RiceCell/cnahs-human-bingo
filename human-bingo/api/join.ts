@@ -24,7 +24,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             .select('id, name, code, bingo_at')
             .single()
 
-        if (!error) return res.status(200).json({ player: data, claims: [], requests: [] })
+        if (!error) return res.status(200).json({ player: data, claims: [], pending: [], requests: [] })
         if (error.code !== '23505') return res.status(500).json({ error: error.message })
         // 23505 = code collision, loop and try a new code
     }
