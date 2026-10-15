@@ -21,7 +21,10 @@ const LINES = [
 ]
 const STORAGE_KEY = 'human-bingo-player-id'
 const TOTAL = 24
-const BOARD_POLL_BASE = 16000
+// Polling is deliberately slow: hundreds of phones share one database, and many are on weak mobile data.
+const CARD_POLL_BASE = 35000
+const BOARD_POLL_BASE = 25000
+const REQUEST_TIMEOUT = 15000
 
 const player = ref<Player | null>(null)
 const claims = ref<Claim[]>([])
@@ -44,12 +47,45 @@ const logoFailed = ref(false)
 const online = ref(typeof navigator === 'undefined' ? true : navigator.onLine)
 const boardFailed = ref(false)
 const cardFailed = ref(false)
+let cardFailures = 0
+let boardFailures = 0
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...init })
-  const body = await res.json().catch(() => ({}))
-  if (!res.ok) throw Object.assign(new Error(body.error ?? 'Something went wrong'), { status: res.status })
-  return body as T
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT)
+  try {
+    const res = await fetch(path, {
+      headers: { 'Content-Type': 'application/json' },
+      ...init,
+      signal: controller.signal,
+    })
+    const body = await res.json().catch((e) => {
+      if (e?.name === 'AbortError') throw e
+      return {}
+    })
+    if (!res.ok) throw Object.assign(new Error(body.error ?? 'Something went wrong'), { status: res.status })
+    return body as T
+  } catch (e) {
+    if ((e as Error)?.name === 'AbortError') {
+      throw Object.assign(new Error('This is taking too long. Check your signal and try again.'), { timeout: true })
+    }
+    if (e instanceof TypeError) {
+      throw new Error("Couldn't reach the server. Check your signal and try again.")
+    }
+    throw e
+  } finally {
+    window.clearTimeout(timer)
+  }
+}
+
+// After a timeout the server may still have saved the change, so refresh the card and warn the player.
+function failMessage(e: unknown) {
+  const err = e as Error & { timeout?: boolean }
+  if (err.timeout) {
+    void loadCard()
+    return 'Slow connection. That may have gone through, so check your card before trying again.'
+  }
+  return err.message
 }
 
 // ---- Card state ----
@@ -146,11 +182,14 @@ async function loadCard() {
     pendingRequests.value = r.requests
     pendingClaims.value = r.pending ?? []
     cardFailed.value = false
+    cardFailures = 0
     const newlySigned = r.claims.find((claim) => !previousSquares.has(claim.square_index))
     if (newlySigned) flashSigned(newlySigned.square_index)
     if (!hadBingo && hasBingo.value) celebrate.value = true
   } catch {
-    cardFailed.value = true
+    // One dropped request on a weak signal is normal; only warn after two in a row
+    cardFailures++
+    if (cardFailures >= 2) cardFailed.value = true
   }
 }
 
@@ -201,7 +240,7 @@ async function mutate(method: 'POST' | 'DELETE') {
       notice.value = wasPending ? 'Request cancelled.' : 'Signature removed.'
     }
   } catch (e) {
-    error.value = (e as Error).message
+    error.value = failMessage(e)
   } finally {
     busy.value = false
   }
@@ -230,7 +269,7 @@ async function reviewRequest(request: ReviewRequest, decision: 'approve' | 'reje
     notice.value = decision === 'approve' ? 'Signature verified.' : 'Signature request declined.'
     await loadCard()
   } catch (e) {
-    error.value = (e as Error).message
+    error.value = failMessage(e)
   } finally {
     busy.value = false
   }
@@ -241,16 +280,20 @@ let timer: number | undefined
 
 function pollDelay() {
   const connection = (navigator as Navigator & { connection?: { saveData?: boolean } }).connection
-  const base = connection?.saveData ? 28000 : BOARD_POLL_BASE
-  return base + Math.random() * 8000
+  const saveData = connection?.saveData
+  const base = tab.value === 'board' ? (saveData ? 40000 : BOARD_POLL_BASE) : (saveData ? 60000 : CARD_POLL_BASE)
+  return base + Math.random() * 10000
 }
 
 async function loadBoard() {
   try {
     board.value = await api<Board>('/api/leaderboard')
+    boardFailures = 0
     boardFailed.value = false
   } catch {
-    boardFailed.value = true
+    boardFailures++
+    // Show the error right away if there is nothing to display yet, otherwise wait for a second failure
+    boardFailed.value = board.value === null || boardFailures >= 2
   }
 }
 
@@ -424,6 +467,16 @@ onUnmounted(() => {
         <button type="button" class="btn ghost" :disabled="!online" @click="loadCard">Try again</button>
       </div>
 
+      <button
+        v-if="tab === 'card'"
+        type="button"
+        class="btn ghost retry"
+        :disabled="!online || busy"
+        @click="loadCard"
+      >
+        Refresh my card
+      </button>
+
       <section v-if="tab === 'card' && pendingRequests.length" class="requests" aria-labelledby="requests-title">
         <h2 id="requests-title">Signatures to verify ({{ pendingRequests.length }})</h2>
         <ul class="request-list">
@@ -526,7 +579,7 @@ onUnmounted(() => {
           </ol>
           <p v-else class="empty">No one has signed a square yet.</p>
 
-          <p class="note">Updates about every 20 seconds. Stay on My card while you play to save data.</p>
+          <p class="note">Updates about every 30 seconds. Stay on My card while you play to save data.</p>
         </template>
         <template v-else-if="boardFailed">
           <p class="empty">Could not load the leaderboard. Check your signal and try again.</p>
