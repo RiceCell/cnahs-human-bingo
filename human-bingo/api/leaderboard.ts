@@ -15,8 +15,8 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
         db.from('claims').select('id', { count: 'exact', head: true }),
     ])
 
-    // The CDN keeps this for 10s, then serves the stale copy while refreshing in the background.
-    res.setHeader('Cache-Control', 'public, s-maxage=10, stale-while-revalidate=20')
+    // Shared CDN cache so ~700 phones do not each hit Supabase. Clients poll ~20s.
+    res.setHeader('Cache-Control', 'public, s-maxage=15, stale-while-revalidate=45')
     return res.status(200).json({
         winners: winners.data ?? [],
         top: top.data ?? [],

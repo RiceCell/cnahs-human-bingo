@@ -18,6 +18,7 @@ const LINES = [
 ]
 const STORAGE_KEY = 'human-bingo-player-id'
 const TOTAL = 24
+const BOARD_POLL_BASE = 16000
 
 const player = ref<Player | null>(null)
 const claims = ref<Claim[]>([])
@@ -34,6 +35,8 @@ const loading = ref(true)
 const busy = ref(false)
 const error = ref('')
 const logoFailed = ref(false)
+const online = ref(typeof navigator === 'undefined' ? true : navigator.onLine)
+const boardFailed = ref(false)
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...init })
@@ -76,6 +79,10 @@ const formatTime = (iso: string) => timeFmt.format(new Date(iso))
 
 // ---- Actions ----
 async function join() {
+  if (!online.value) {
+    error.value = "You're offline. Check your signal and try again."
+    return
+  }
   busy.value = true
   error.value = ''
   try {
@@ -129,6 +136,10 @@ function flashSigned(i: number) {
 
 async function mutate(method: 'POST' | 'DELETE') {
   if (sheet.value === null || !player.value) return
+  if (!online.value) {
+    error.value = "You're offline. Check your signal and try again."
+    return
+  }
   const square = sheet.value
   const hadBingo = hasBingo.value
   busy.value = true
@@ -159,24 +170,56 @@ async function mutate(method: 'POST' | 'DELETE') {
 // ---- Leaderboard polling: only while the Leaderboard tab is open and the page is visible ----
 let timer: number | undefined
 
+function pollDelay() {
+  const connection = (navigator as Navigator & { connection?: { saveData?: boolean } }).connection
+  const base = connection?.saveData ? 28000 : BOARD_POLL_BASE
+  return base + Math.random() * 8000
+}
+
 async function loadBoard() {
   try {
     board.value = await api<Board>('/api/leaderboard')
+    boardFailed.value = false
   } catch {
-    /* keep the last good data */
+    boardFailed.value = true
+  }
+}
+
+function stopPolling() {
+  if (timer !== undefined) {
+    clearTimeout(timer)
+    timer = undefined
   }
 }
 
 function syncPolling() {
-  const active = tab.value === 'board' && document.visibilityState === 'visible'
-  if (active && timer === undefined) {
-    loadBoard()
-    // Random interval per phone so 1,000 clients don't all fire on the same second
-    timer = window.setInterval(loadBoard, 8000 + Math.random() * 4000)
-  } else if (!active && timer !== undefined) {
-    clearInterval(timer)
-    timer = undefined
+  const active = tab.value === 'board' && document.visibilityState === 'visible' && online.value
+  if (!active) {
+    stopPolling()
+    return
   }
+  if (timer !== undefined) return
+  loadBoard()
+  const tick = () => {
+    timer = window.setTimeout(async () => {
+      timer = undefined
+      if (tab.value === 'board' && document.visibilityState === 'visible' && online.value) {
+        await loadBoard()
+        tick()
+      }
+    }, pollDelay())
+  }
+  tick()
+}
+
+function onOnline() {
+  online.value = true
+  error.value = ''
+  syncPolling()
+}
+function onOffline() {
+  online.value = false
+  stopPolling()
 }
 
 // ---- Keyboard + scroll lock ----
@@ -198,29 +241,49 @@ watch(
 onMounted(() => {
   restore()
   document.addEventListener('visibilitychange', syncPolling)
+  window.addEventListener('online', onOnline)
+  window.addEventListener('offline', onOffline)
   window.addEventListener('keydown', onKey)
 })
 onUnmounted(() => {
   document.removeEventListener('visibilitychange', syncPolling)
+  window.removeEventListener('online', onOnline)
+  window.removeEventListener('offline', onOffline)
   window.removeEventListener('keydown', onKey)
   document.body.style.overflow = ''
-  if (timer !== undefined) clearInterval(timer)
+  stopPolling()
 })
 </script>
 
 <template>
   <main class="app" :class="{ 'has-dock': player }">
+    <p v-if="!online" class="banner" role="status">You're offline. Signatures need a signal.</p>
+
     <!-- Loading -->
     <div v-if="loading" class="boot">
-      <div class="sun-fallback" aria-hidden="true">CNAHS</div>
+      <div class="logo-halo">
+        <div class="sun-fallback" aria-hidden="true">CNAHS</div>
+      </div>
       <p>Loading your card</p>
     </div>
 
     <!-- Join -->
     <form v-else-if="!player" class="join" @submit.prevent="join">
       <div class="join-hero">
-        <img v-if="!logoFailed" class="join-logo" src="/cnahs-logo.png" alt="CNAHS" @error="logoFailed = true" />
-        <div v-else class="sun-fallback" aria-hidden="true">CNAHS</div>
+        <div class="logo-halo">
+          <img
+            v-if="!logoFailed"
+            class="join-logo"
+            src="/cnahs-logo.png"
+            alt="CNAHS"
+            width="150"
+            height="150"
+            decoding="async"
+            @error="logoFailed = true"
+          />
+          <div v-else class="sun-fallback" aria-hidden="true">CNAHS</div>
+        </div>
+        <p class="kicker">Cebu Normal University · CNAHS</p>
         <h1>Human Bingo</h1>
         <p class="lede">Meet someone new, get their code, and fill your card.</p>
       </div>
@@ -228,7 +291,7 @@ onUnmounted(() => {
       <div class="join-card">
         <label for="name">Your name or nickname</label>
         <input id="name" v-model="nameInput" class="field" maxlength="40" autocomplete="name" required />
-        <button class="btn" :disabled="busy || !nameInput.trim()">
+        <button class="btn" :disabled="busy || !nameInput.trim() || !online">
           {{ busy ? 'Getting your card…' : 'Get my card' }}
         </button>
         <p v-if="error" class="error" role="alert">{{ error }}</p>
@@ -245,7 +308,16 @@ onUnmounted(() => {
     <!-- Game -->
     <template v-else>
       <header class="top">
-        <img v-if="!logoFailed" class="mark" src="/cnahs-logo.png" alt="" @error="logoFailed = true" />
+        <img
+          v-if="!logoFailed"
+          class="mark"
+          src="/cnahs-logo.png"
+          alt=""
+          width="42"
+          height="42"
+          decoding="async"
+          @error="logoFailed = true"
+        />
         <span class="who-name">{{ player.name }}</span>
         <button class="chip" type="button" aria-label="Show my code in large letters" @click="showCode = true">
           <span class="chip-label">Your code</span>
@@ -276,7 +348,15 @@ onUnmounted(() => {
       <section v-if="tab === 'card'" class="board-grid" aria-label="Your bingo card">
         <template v-for="(sq, i) in SQUARES" :key="i">
           <div v-if="i === FREE_SQUARE" class="tile free" :class="{ win: winningSquares.has(i) }">
-            <img v-if="!logoFailed" src="/cnahs-logo.png" alt="CNAHS free square" @error="logoFailed = true" />
+            <img
+              v-if="!logoFailed"
+              src="/cnahs-logo.png"
+              alt="CNAHS free square"
+              width="64"
+              height="64"
+              decoding="async"
+              @error="logoFailed = true"
+            />
             <span v-else class="free-text">CNAHS</span>
           </div>
 
@@ -284,7 +364,7 @@ onUnmounted(() => {
             v-else
             type="button"
             class="tile"
-            :class="[(i % 5) % 2 ? 'gold' : 'red', { signed: claimedBy.has(i), win: winningSquares.has(i) }]"
+            :class="[(i + Math.floor(i / 5)) % 2 ? 'gold' : 'red', { signed: claimedBy.has(i), win: winningSquares.has(i) }]"
             :aria-label="tileLabel(i)"
             @click="openSheet(i)"
           >
@@ -302,10 +382,15 @@ onUnmounted(() => {
             <div class="stat"><b>{{ board.totalClaims }}</b><span>squares signed</span></div>
           </div>
 
+          <p v-if="boardFailed" class="error" role="status">Could not refresh. Showing the last list we got.</p>
+          <button v-if="boardFailed" type="button" class="btn ghost retry" :disabled="!online" @click="loadBoard">
+            Try again
+          </button>
+
           <h2>First to bingo</h2>
           <ol v-if="board.winners.length" class="rank">
             <li v-for="(w, idx) in board.winners" :key="w.id" :class="{ me: w.id === player.id }">
-              <span class="pos">{{ idx + 1 }}</span>
+              <span class="pos" :class="'p' + idx">{{ idx + 1 }}</span>
               <div class="info">
                 <div class="line">
                   <span class="nm">{{ w.name }}</span>
@@ -320,7 +405,7 @@ onUnmounted(() => {
           <h2>Most squares signed</h2>
           <ol v-if="board.top.length" class="rank">
             <li v-for="(p, idx) in board.top" :key="p.id" :class="{ me: p.id === player.id }">
-              <span class="pos">{{ idx + 1 }}</span>
+              <span class="pos" :class="'p' + idx">{{ idx + 1 }}</span>
               <div class="info">
                 <div class="line">
                   <span class="nm">{{ p.name }}</span>
@@ -333,7 +418,11 @@ onUnmounted(() => {
           </ol>
           <p v-else class="empty">No one has signed a square yet.</p>
 
-          <p class="note">Updates about every 10 seconds.</p>
+          <p class="note">Updates about every 20 seconds. Stay on My card while you play to save data.</p>
+        </template>
+        <template v-else-if="boardFailed">
+          <p class="empty">Could not load the leaderboard. Check your signal and try again.</p>
+          <button type="button" class="btn" :disabled="!online" @click="loadBoard">Try again</button>
         </template>
         <p v-else class="empty">Loading the leaderboard…</p>
       </section>
@@ -442,7 +531,7 @@ onUnmounted(() => {
   --coral: #f2705a;
   --linen: #fff5e4;
   --pen: #1f3fa6;
-  --font: 'Bricolage Grotesque', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
   --hand: 'Caveat', 'Segoe Print', 'Bradley Hand', cursive;
 }
 
@@ -461,6 +550,10 @@ body {
 
 .app { max-width: 480px; margin: 0 auto; padding: 14px; min-height: 100dvh; }
 .app.has-dock { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
+.banner {
+  margin: 0 0 12px; padding: 10px 12px; border-radius: 12px; text-align: center;
+  font-weight: 700; font-size: 14px; background: #ffe1da; color: #8a1a0b;
+}
 
 /* ---------- Shared controls ---------- */
 .btn {
@@ -495,16 +588,29 @@ label { display: block; font-weight: 700; font-size: 15px; margin-bottom: 6px; }
   font-size: 24px; font-weight: 800; color: var(--ember);
   background: radial-gradient(circle at 50% 35%, #fff1b8, #f6b93b 60%, #ee9a1e);
 }
+.logo-halo {
+  width: 168px; height: 168px; margin: 0 auto; border-radius: 50%;
+  display: grid; place-items: center;
+  background: radial-gradient(circle at 50% 42%, rgba(255, 245, 228, 0.95), rgba(255, 245, 228, 0.2) 62%, transparent 70%);
+  box-shadow: 0 0 0 6px rgba(255, 245, 228, 0.18);
+}
 .join { display: flex; flex-direction: column; gap: 22px; padding-top: max(12px, env(safe-area-inset-top)); }
 .join-hero { text-align: center; }
-.join-logo { display: block; width: 150px; height: 150px; margin: 0 auto; object-fit: contain; }
+.join-logo { display: block; width: 150px; height: 150px; object-fit: contain; }
+.kicker {
+  margin: 10px 0 0; font-size: 12px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase;
+  color: rgba(61, 15, 8, 0.78);
+}
 .join h1 {
-  margin: 12px 0 8px; font-size: clamp(36px, 11vw, 48px); line-height: 1; font-weight: 800; letter-spacing: -0.02em;
+  margin: 8px 0 8px; font-size: clamp(36px, 11vw, 48px); line-height: 1; font-weight: 800; letter-spacing: -0.02em;
 }
 .lede { margin: 0 auto; max-width: 26ch; font-size: 19px; line-height: 1.3; font-weight: 500; }
 .join-card { background: var(--linen); border-radius: 22px; padding: 18px; box-shadow: 0 5px 0 rgba(142, 26, 14, 0.35); }
-.steps { list-style: none; margin: 0; padding: 0 4px; display: flex; flex-direction: column; gap: 10px; font-size: 16px; font-weight: 500; }
-.steps li { display: flex; align-items: center; gap: 12px; }
+.steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; font-size: 16px; font-weight: 500; }
+.steps li {
+  display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 14px;
+  background: rgba(255, 245, 228, 0.38);
+}
 .n {
   flex: none; width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center;
   background: var(--linen); color: var(--ember); font-weight: 800; font-size: 15px;
@@ -557,8 +663,9 @@ label { display: block; font-weight: 700; font-size: 15px; margin-bottom: 6px; }
 .tile.red .tile-sign { border-color: rgba(255, 245, 228, 0.8); }
 .tile.gold { background: var(--marigold); color: var(--ember-deep); }
 .tile.gold .tile-sign { border-color: rgba(61, 15, 8, 0.65); }
-.tile.signed { background: var(--linen); color: rgba(61, 15, 8, 0.6); }
+.tile.signed { background: var(--linen); color: rgba(61, 15, 8, 0.55); }
 .tile.signed .tile-sign { color: var(--pen); border-color: rgba(31, 63, 166, 0.45); }
+.tile.signed .tile-label { font-weight: 600; }
 .tile.win {
   background: radial-gradient(circle at 50% 30%, #fff0b3, #f4b43a); color: var(--ember-deep);
   box-shadow: inset 0 0 0 2px var(--ember);
@@ -583,7 +690,9 @@ label { display: block; font-weight: 700; font-size: 15px; margin-bottom: 6px; }
   flex: none; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center;
   font-weight: 800; background: #f4e3c6; color: var(--ember);
 }
-.rank li:first-child .pos { background: var(--marigold); color: var(--ember-deep); }
+.rank li:first-child .pos, .pos.p0 { background: var(--marigold); color: var(--ember-deep); }
+.pos.p1 { background: #d9d4cc; color: var(--ember-deep); }
+.pos.p2 { background: #e0aa6a; color: var(--ember-deep); }
 .info { flex: 1; min-width: 0; }
 .line { display: flex; align-items: baseline; gap: 8px; }
 .nm { min-width: 0; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -593,6 +702,7 @@ label { display: block; font-weight: 700; font-size: 15px; margin-bottom: 6px; }
 .meter i { display: block; height: 100%; border-radius: 99px; background: var(--papaya); }
 .empty { margin: 0; font-size: 15px; font-weight: 500; }
 .note { margin: 18px 0 0; font-size: 13px; opacity: 0.75; }
+.retry { margin-top: 10px; }
 
 /* ---------- Bottom navigation ---------- */
 .dock {
