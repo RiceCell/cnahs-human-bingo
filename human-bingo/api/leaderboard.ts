@@ -8,12 +8,14 @@ export default async function handler(_req: VercelRequest, res: VercelResponse) 
             .not('bingo_at', 'is', null)
             .order('bingo_at', { ascending: true })
             .limit(10),
-        db.from('leaderboard').select('id, name, filled')
+        db.from('approved_leaderboard').select('id, name, filled')
             .order('filled', { ascending: false })
             .limit(10),
         db.from('players').select('id', { count: 'exact', head: true }),
-        db.from('claims').select('id', { count: 'exact', head: true }),
+        db.from('claims').select('id', { count: 'exact', head: true }).eq('status', 'approved'),
     ])
+    const queryError = [winners.error, top.error, players.error, claims.error].find((error) => error !== null)
+    if (queryError) return res.status(500).json({ error: queryError.message })
 
     // Shared CDN cache so ~700 phones do not each hit Supabase. Clients poll ~20s.
     res.setHeader('Cache-Control', 'public, s-maxage=15, stale-while-revalidate=45')

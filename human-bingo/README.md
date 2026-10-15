@@ -11,6 +11,10 @@ Local setup:
 3. Start the app locally:
    - `npm run dev`
 
+Before deploying the signature verification feature, run
+[`supabase/migrations/20261015000000_add_claim_review.sql`](./supabase/migrations/20261015000000_add_claim_review.sql)
+in the Supabase SQL Editor. Existing signatures remain approved; new signatures require the code owner to verify them.
+
 The Vue app runs on `http://127.0.0.1:4173` and proxies `/api/*` to the Vercel API at `http://127.0.0.1:3000`.
 
 Note: `VERCEL_OIDC_TOKEN` is not enough for local `vercel dev` in this setup; use a valid Vercel token or run `vercel login` first.

@@ -40,6 +40,7 @@ export async function syncBingo(playerId: string) {
         .from('claims')
         .select('square_index, signed_by')
         .eq('player_id', playerId)
+        .eq('status', 'approved')
     if (error) throw error
 
     const { data: player, error: playerError } = await db

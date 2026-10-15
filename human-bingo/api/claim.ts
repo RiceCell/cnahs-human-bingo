@@ -14,24 +14,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     if (squareIndex === FREE_SQUARE) return res.status(400).json({ error: 'That square is free' })
 
+    let requestSentTo: string | undefined
     try {
         if (req.method === 'POST') {
             const code = String(signerCode ?? '').trim().toUpperCase()
             if (!code) return res.status(400).json({ error: "Enter the other person's code" })
 
-            const { data: signer } = await db
+            const { data: signer, error: signerError } = await db
                 .from('players')
                 .select('id, name')
                 .eq('code', code)
                 .maybeSingle()
+            if (signerError) throw signerError
             if (!signer) return res.status(404).json({ error: 'No player with that code' })
             if (signer.id === playerId) return res.status(400).json({ error: "You can't sign your own card" })
+            requestSentTo = signer.name
 
             const { error } = await db.from('claims').insert({
                 player_id: playerId,
                 square_index: squareIndex,
                 signed_by: signer.name,
                 signer_id: signer.id,
+                status: 'pending',
             })
             if (error) {
                 if (error.code === '23505') {
@@ -53,7 +57,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             if (error) throw error
         }
 
-        return res.status(200).json(await syncBingo(playerId))
+        const result = await syncBingo(playerId)
+        return res.status(200).json({
+            ...result,
+            ...(requestSentTo ? { requestSentTo } : {}),
+        })
     } catch (e) {
         return res.status(500).json({ error: (e as Error).message })
     }

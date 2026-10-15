@@ -4,6 +4,7 @@ import { FREE_SQUARE, SQUARES } from './bingoCard'
 
 type Player = { id: string; name: string; code: string; bingo_at: string | null }
 type Claim = { square_index: number; signed_by: string }
+type ReviewRequest = { id: string; square_index: number; claimant_name: string }
 type Board = {
   winners: { id: string; name: string; bingo_at: string }[]
   top: { id: string; name: string; filled: number }[]
@@ -22,6 +23,7 @@ const BOARD_POLL_BASE = 16000
 
 const player = ref<Player | null>(null)
 const claims = ref<Claim[]>([])
+const pendingRequests = ref<ReviewRequest[]>([])
 const board = ref<Board | null>(null)
 const tab = ref<'card' | 'board'>('card')
 const nameInput = ref('')
@@ -34,9 +36,11 @@ const codeInput = ref<HTMLInputElement | null>(null)
 const loading = ref(true)
 const busy = ref(false)
 const error = ref('')
+const notice = ref('')
 const logoFailed = ref(false)
 const online = ref(typeof navigator === 'undefined' ? true : navigator.onLine)
 const boardFailed = ref(false)
+const cardFailed = ref(false)
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...init })
@@ -85,14 +89,17 @@ async function join() {
   }
   busy.value = true
   error.value = ''
+  notice.value = ''
   try {
-    const r = await api<{ player: Player; claims: Claim[] }>('/api/join', {
+    const r = await api<{ player: Player; claims: Claim[]; requests: ReviewRequest[] }>('/api/join', {
       method: 'POST',
       body: JSON.stringify({ name: nameInput.value }),
     })
     player.value = r.player
     claims.value = r.claims
+    pendingRequests.value = r.requests
     localStorage.setItem(STORAGE_KEY, r.player.id)
+    syncPolling()
   } catch (e) {
     error.value = (e as Error).message
   } finally {
@@ -104,9 +111,10 @@ async function restore() {
   const id = localStorage.getItem(STORAGE_KEY)
   if (id) {
     try {
-      const r = await api<{ player: Player; claims: Claim[] }>(`/api/card?id=${id}`)
+      const r = await api<{ player: Player; claims: Claim[]; requests: ReviewRequest[] }>(`/api/card?id=${id}`)
       player.value = r.player
       claims.value = r.claims
+      pendingRequests.value = r.requests
     } catch (e) {
       // Only forget the card if the server says it doesn't exist
       if ((e as { status?: number }).status === 404) localStorage.removeItem(STORAGE_KEY)
@@ -114,6 +122,27 @@ async function restore() {
     }
   }
   loading.value = false
+  syncPolling()
+}
+
+async function loadCard() {
+  if (!player.value) return
+  try {
+    const r = await api<{ player: Player; claims: Claim[]; requests: ReviewRequest[] }>(
+      `/api/card?id=${player.value.id}`
+    )
+    const previousSquares = new Set(claims.value.map((claim) => claim.square_index))
+    const hadBingo = hasBingo.value
+    player.value = r.player
+    claims.value = r.claims
+    pendingRequests.value = r.requests
+    cardFailed.value = false
+    const newlySigned = r.claims.find((claim) => !previousSquares.has(claim.square_index))
+    if (newlySigned) flashSigned(newlySigned.square_index)
+    if (!hadBingo && hasBingo.value) celebrate.value = true
+  } catch {
+    cardFailed.value = true
+  }
 }
 
 function openSheet(i: number) {
@@ -141,11 +170,10 @@ async function mutate(method: 'POST' | 'DELETE') {
     return
   }
   const square = sheet.value
-  const hadBingo = hasBingo.value
   busy.value = true
   error.value = ''
   try {
-    const r = await api<{ claims: Claim[]; bingoAt: string | null }>('/api/claim', {
+    const r = await api<{ claims: Claim[]; bingoAt: string | null; requestSentTo?: string }>('/api/claim', {
       method,
       body: JSON.stringify({
         playerId: player.value.id,
@@ -157,9 +185,39 @@ async function mutate(method: 'POST' | 'DELETE') {
     player.value.bingo_at = r.bingoAt
     closeSheet()
     if (method === 'POST') {
-      flashSigned(square)
-      if (!hadBingo && hasBingo.value) celebrate.value = true
+      notice.value = `Signature request sent to ${r.requestSentTo ?? 'the code owner'}. It will count once they verify it.`
+    } else {
+      notice.value = 'Signature removed.'
     }
+  } catch (e) {
+    error.value = (e as Error).message
+  } finally {
+    busy.value = false
+  }
+}
+
+async function reviewRequest(request: ReviewRequest, decision: 'approve' | 'reject') {
+  if (!player.value) return
+  if (!online.value) {
+    error.value = "You're offline. Check your signal and try again."
+    return
+  }
+
+  busy.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    await api<{ ok: true }>('/api/review', {
+      method: 'POST',
+      body: JSON.stringify({
+        playerId: player.value.id,
+        code: player.value.code,
+        requestId: request.id,
+        decision,
+      }),
+    })
+    notice.value = decision === 'approve' ? 'Signature verified.' : 'Signature request declined.'
+    await loadCard()
   } catch (e) {
     error.value = (e as Error).message
   } finally {
@@ -193,18 +251,19 @@ function stopPolling() {
 }
 
 function syncPolling() {
-  const active = tab.value === 'board' && document.visibilityState === 'visible' && online.value
+  const active = player.value !== null && document.visibilityState === 'visible' && online.value
   if (!active) {
     stopPolling()
     return
   }
   if (timer !== undefined) return
-  loadBoard()
+  const refresh = tab.value === 'board' ? loadBoard : loadCard
+  refresh()
   const tick = () => {
     timer = window.setTimeout(async () => {
       timer = undefined
-      if (tab.value === 'board' && document.visibilityState === 'visible' && online.value) {
-        await loadBoard()
+      if (player.value && document.visibilityState === 'visible' && online.value) {
+        await (tab.value === 'board' ? loadBoard() : loadCard())
         tick()
       }
     }, pollDelay())
@@ -230,7 +289,10 @@ function onKey(e: KeyboardEvent) {
   else if (sheet.value !== null) closeSheet()
 }
 
-watch(tab, syncPolling)
+watch(tab, () => {
+  stopPolling()
+  syncPolling()
+})
 watch(
   () => sheet.value !== null || showCode.value || celebrate.value,
   (open) => {
@@ -300,7 +362,7 @@ onUnmounted(() => {
       <ol class="steps">
         <li><span class="n">1</span>Get your card and your 4-letter code.</li>
         <li><span class="n">2</span>Find someone who fits a square.</li>
-        <li><span class="n">3</span>Ask for their code and type it in to sign.</li>
+        <li><span class="n">3</span>Ask for their code; they can verify your signature request.</li>
         <li><span class="n">4</span>Fill a full row, column, or diagonal for a bingo.</li>
       </ol>
     </form>
@@ -343,6 +405,41 @@ onUnmounted(() => {
           <div class="fill" :style="{ width: progressPct + '%' }"></div>
         </div>
       </div>
+
+      <p v-if="notice" class="notice" role="status">{{ notice }}</p>
+      <p v-if="error && sheet === null" class="error" role="alert">{{ error }}</p>
+      <div v-if="cardFailed" class="card-refresh-error">
+        <p class="error" role="status">Could not refresh your card or signature requests.</p>
+        <button type="button" class="btn ghost" :disabled="!online" @click="loadCard">Try again</button>
+      </div>
+
+      <section v-if="tab === 'card' && pendingRequests.length" class="requests" aria-labelledby="requests-title">
+        <h2 id="requests-title">Signatures to verify ({{ pendingRequests.length }})</h2>
+        <ul class="request-list">
+          <li v-for="request in pendingRequests" :key="request.id" class="request">
+            <p><strong>{{ request.claimant_name }}</strong> says they match:</p>
+            <p class="request-prompt">“{{ SQUARES[request.square_index].prompt }}”</p>
+            <div class="request-actions">
+              <button
+                type="button"
+                class="btn ghost"
+                :disabled="busy || !online"
+                @click="reviewRequest(request, 'reject')"
+              >
+                Decline
+              </button>
+              <button
+                type="button"
+                class="btn"
+                :disabled="busy || !online"
+                @click="reviewRequest(request, 'approve')"
+              >
+                {{ busy ? 'Saving…' : 'Verify signature' }}
+              </button>
+            </div>
+          </li>
+        </ul>
+      </section>
 
       <!-- Card -->
       <section v-if="tab === 'card'" class="board-grid" aria-label="Your bingo card">
@@ -500,7 +597,7 @@ onUnmounted(() => {
         <div class="sheet" role="dialog" aria-modal="true" aria-label="Your code">
           <div class="grabber" aria-hidden="true"></div>
           <button type="button" class="close" aria-label="Close" @click="showCode = false">×</button>
-          <p class="prompt">Show this to someone so they can sign your card.</p>
+          <p class="prompt">Show this code to someone requesting your signature. You can verify their request on your card.</p>
           <p class="code-plate">{{ player.code }}</p>
           <button type="button" class="btn" @click="showCode = false">Done</button>
         </div>
@@ -679,6 +776,23 @@ label { display: block; font-weight: 700; font-size: 15px; margin-bottom: 6px; }
 
 /* ---------- Leaderboard ---------- */
 .panel { background: var(--linen); border-radius: 22px; padding: 18px 16px; box-shadow: 0 5px 0 rgba(142, 26, 14, 0.35); }
+.requests {
+  margin-bottom: 12px; padding: 16px; border-radius: 18px; background: var(--linen);
+  box-shadow: 0 5px 0 rgba(142, 26, 14, 0.35);
+}
+.requests h2 { margin: 0 0 10px; font-size: 18px; font-weight: 800; }
+.request-list { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.request { padding: 12px; border-radius: 12px; background: #fff; }
+.request p { margin: 0; font-size: 15px; }
+.request-prompt { margin-top: 4px !important; color: var(--ember); font-weight: 700; }
+.request-actions { display: flex; gap: 8px; margin-top: 12px; }
+.request-actions .btn { flex: 1; padding: 11px 8px; font-size: 15px; }
+.notice {
+  margin: 0 0 12px; padding: 10px 12px; border-radius: 12px; background: #e4f2d7;
+  color: #244616; font-weight: 700; font-size: 14px;
+}
+.card-refresh-error { margin-bottom: 12px; }
+.card-refresh-error .btn { margin-top: 8px; }
 .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .stat b { display: block; font-size: 32px; font-weight: 800; line-height: 1; color: var(--ember); font-variant-numeric: tabular-nums; }
 .stat span { font-size: 14px; font-weight: 500; }
