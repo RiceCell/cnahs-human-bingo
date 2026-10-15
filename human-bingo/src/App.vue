@@ -283,7 +283,7 @@ onUnmounted(() => {
           />
           <div v-else class="sun-fallback" aria-hidden="true">CNAHS</div>
         </div>
-        <p class="kicker">Cebu Normal University · CNAHS</p>
+        <p class="kicker">Cebu Institue of Technology University - CNAHS Akwe</p>
         <h1>Human Bingo</h1>
         <p class="lede">Meet someone new, get their code, and fill your card.</p>
       </div>
